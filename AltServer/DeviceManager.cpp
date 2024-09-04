@@ -480,8 +480,10 @@ pplx::task<void> DeviceManager::InstallApp(std::string appFilepath, std::string 
 			auto narrowDestinationPath = StringFromWideString(destinationPath.c_str());
 			std::replace(narrowDestinationPath.begin(), narrowDestinationPath.end(), '\\', '/');
 
-			instproxy_install(ipc, narrowDestinationPath.c_str(), options, DeviceManagerUpdateStatus, uuidString);
-			instproxy_client_options_free(options);
+			pplx::create_task([ipc, narrowDestinationPath, options, uuidString] {
+				instproxy_install(ipc, narrowDestinationPath.c_str(), options, DeviceManagerUpdateStatus, uuidString);
+				instproxy_client_options_free(options);
+			});
 
 			// Wait until we're finished installing;
 			std::unique_lock<std::mutex> lock(waitingMutex);
