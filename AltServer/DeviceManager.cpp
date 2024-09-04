@@ -271,6 +271,24 @@ pplx::task<void> DeviceManager::InstallApp(std::string appFilepath, std::string 
 			}
 
 
+			/* Get iOS Version */
+			plist_t device_version_plist = NULL;
+			char* device_version_string = NULL;
+			OperatingSystemVersion osVersion = { 18, 0, 0 };
+
+			if (lockdownd_get_value(client, NULL, "ProductVersion", &device_version_plist) == LOCKDOWN_E_SUCCESS && device_version_plist != NULL)
+			{
+				plist_get_string_val(device_version_plist, &device_version_string);
+				if (device_version_string != NULL)
+				{
+					osVersion = OperatingSystemVersion(device_version_string);
+					free(device_version_string);
+				}
+
+				plist_free(device_version_plist);
+			}
+
+
 			/* Connect to AFC service */
 			if ((lockdownd_start_service(client, "com.apple.afc", &service) != LOCKDOWN_E_SUCCESS) || service == NULL)
 			{
@@ -372,10 +390,15 @@ pplx::task<void> DeviceManager::InstallApp(std::string appFilepath, std::string 
 				service = NULL;
 			}
 
-			/* Provisioning Profiles */			
-			bool shouldManageProfiles = (activeProfiles.has_value() || (application->provisioningProfile() != NULL && application->provisioningProfile()->isFreeProvisioningProfile()));
+			/* Provisioning Profiles */		
+
+			// As of iOS 18, removing all provisioning profiles causes apps to become unverified.
+			// Thankfully this technique is no longer necessary, so only remove profiles on devices running iOS 17.x or earlier.
+			bool isAtLeastiOS18 = (osVersion.majorVersion >= 18);
+			bool shouldManageProfiles = !isAtLeastiOS18 && (activeProfiles.has_value() || (application->provisioningProfile() != NULL && application->provisioningProfile()->isFreeProvisioningProfile()));
+
 			if (shouldManageProfiles)
-			{				
+			{
 				// Free developer account was used to sign this app, so we need to remove all
 				// provisioning profiles in order to remain under sideloaded app limit.
 
