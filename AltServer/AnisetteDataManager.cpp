@@ -189,6 +189,8 @@ bool AnisetteDataManager::LoadiCloudDependencies()
 		return false;
 	}
 
+	#if SPOOF_MAC
+
 	{
 		/** Client Info Swizzling */
 
@@ -266,6 +268,8 @@ bool AnisetteDataManager::LoadiCloudDependencies()
 			functionImplementation[i] = instruction[i];
 		}
 	}
+
+	#endif
 }
 
 bool AnisetteDataManager::LoadDependencies()
@@ -346,12 +350,10 @@ bool AnisetteDataManager::LoadDependencies()
 		throw AnisetteError(AnisetteErrorCode::InvalidiTunesInstallation);
 	}
 
-#if SPOOF_MAC
 	if (!this->LoadiCloudDependencies())
 	{
 		return false;
 	}
-#endif
 
 	this->loadedDependencies = true;
 
@@ -365,12 +367,10 @@ std::shared_ptr<AnisetteData> AnisetteDataManager::FetchAnisetteData()
 		this->LoadDependencies();
 	}
 
-#if SPOOF_MAC
 	if (GetClientInfo == NULL || GetDeviceID == NULL || GetLocalUserID == NULL)
 	{
 		return NULL;
 	}
-#endif
 
 	std::shared_ptr<AnisetteData> anisetteData = NULL;
 
@@ -400,24 +400,14 @@ std::shared_ptr<AnisetteData> AnisetteDataManager::FetchAnisetteData()
 
 		/* Device Hardware */
 
-		ObjcObject* deviceDescription = (ObjcObject*)ALTClientInfoReplacementFunction(NULL);
-		ObjcObject* deviceID = (ObjcObject*)ALTDeviceIDReplacementFunction();
+		ObjcObject* deviceDescription = (ObjcObject*)GetClientInfo(NULL);
+		ObjcObject* deviceID = (ObjcObject*)GetDeviceID();
+		ObjcObject* localUserID = (ObjcObject*)GetLocalUserID();
 
 		if (deviceDescription == NULL || deviceID == NULL)
 		{
 			return;
 		}
-
-#if SPOOF_MAC
-		ObjcObject* localUserID = (ObjcObject*)GetLocalUserID();
-#else
-		std::string description = deviceID->description();
-
-		std::vector<unsigned char> deviceIDData(description.begin(), description.end());
-		auto encodedDeviceID = StringFromWideString(utility::conversions::to_base64(deviceIDData));
-
-		ObjcObject* localUserID = (ObjcObject*)((id(*)(id, SEL, const char*))objc_msgSend)(NSString, stringInit, encodedDeviceID.c_str());
-#endif
 
 		std::string deviceSerialNumber = "C02LKHBBFD57";
 
@@ -436,7 +426,7 @@ std::shared_ptr<AnisetteData> AnisetteDataManager::FetchAnisetteData()
 			machineID->description(),
 			otp->description(),
 			localUserID->description(),
-			17106176,
+			84215040,
 			deviceID->description(),
 			deviceSerialNumber,
 			deviceDescription->description(),
