@@ -254,6 +254,7 @@ void WriteFileToZipFile(zipFile *zipFile, fs::path filepath, fs::path relativePa
     
     char *bytes = nullptr;
     unsigned int fileSize = 0;
+    std::vector<char> data;
     
     if (isDirectory)
     {
@@ -280,8 +281,12 @@ void WriteFileToZipFile(zipFile *zipFile, fs::path filepath, fs::path relativePa
         
         fileInfo.external_fa = (unsigned int)(permissionsLong << 16L);
         
-        std::ifstream ifs(filepath.string());
-        std::vector<char> data((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+        std::ifstream ifs(filepath.string(), std::ios::binary);
+        if (!ifs)
+        {
+            throw ArchiveError(ArchiveErrorCode::NoSuchFile);
+        }
+        data.assign(std::istreambuf_iterator<char>(ifs), std::istreambuf_iterator<char>());
         
         bytes = data.data();
         fileSize = (unsigned int)data.size();
@@ -293,10 +298,22 @@ void WriteFileToZipFile(zipFile *zipFile, fs::path filepath, fs::path relativePa
     {
         throw ArchiveError(ArchiveErrorCode::UnknownWrite);
     }
-    
+
+    // minizip expects a non-null pointer even for 0-length writes in some builds.
+    const char empty[] = "";
+    if (fileSize == 0)
+    {
+        bytes = (char*)empty;
+    }
+
     if (zipWriteInFileInZip(*zipFile, bytes, fileSize) != ZIP_OK)
     {
         zipCloseFileInZip(*zipFile);
+        throw ArchiveError(ArchiveErrorCode::UnknownWrite);
+    }
+
+    if (zipCloseFileInZip(*zipFile) != ZIP_OK)
+    {
         throw ArchiveError(ArchiveErrorCode::UnknownWrite);
     }
 }
@@ -304,13 +321,13 @@ void WriteFileToZipFile(zipFile *zipFile, fs::path filepath, fs::path relativePa
 std::string ZipAppBundle(std::string filepath)
 {
     fs::path appBundlePath = filepath;
-    
+	    
     auto appBundleFilename = appBundlePath.filename();
     auto appName = appBundlePath.filename().stem().string();
-    
+	    
     auto ipaName = appName + ".ipa";
-    auto ipaPath = appBundlePath.remove_filename().append(ipaName);
-    
+    auto ipaPath = appBundlePath.parent_path() / ipaName;
+	    
     if (fs::exists(ipaPath))
     {
         fs::remove(ipaPath);
@@ -322,23 +339,40 @@ std::string ZipAppBundle(std::string filepath)
         throw ArchiveError(ArchiveErrorCode::UnknownWrite);
     }
     
-    fs::path payloadDirectory = "Payload";
-    fs::path appBundleDirectory = payloadDirectory.append(appBundleFilename.string());
-    
-    fs::path rootPath = fs::relative("", appBundleDirectory);
-    
-    for (auto& entry: fs::recursive_directory_iterator(rootPath))
+    try
     {
-        auto filepath = entry.path();
-        auto relativePath = entry.path().relative_path();
-        
-        WriteFileToZipFile(&zipFile, filepath, relativePath);
+        // Write minimal IPA structure:
+        //   Payload/
+        //   Payload/<App>.app/...
+        fs::path payloadDirectory = "Payload";
+        fs::path appBundleDirectory = fs::path("Payload").append(appBundleFilename.string());
+
+        // Directory entries.
+        WriteFileToZipFile(&zipFile, appBundlePath, payloadDirectory);
+        WriteFileToZipFile(&zipFile, appBundlePath, appBundleDirectory);
+
+        for (auto& entry : fs::recursive_directory_iterator(appBundlePath))
+        {
+            auto srcPath = entry.path();
+
+            std::error_code ec;
+            auto rel = fs::relative(srcPath, appBundlePath, ec);
+            if (ec)
+            {
+                continue;
+            }
+
+            auto zipPath = fs::path(appBundleDirectory).append(rel.string());
+            WriteFileToZipFile(&zipFile, srcPath, zipPath);
+        }
+
+        zipClose(zipFile, NULL);
     }
-    
-    WriteFileToZipFile(&zipFile, payloadDirectory, payloadDirectory);
-    WriteFileToZipFile(&zipFile, appBundleDirectory, appBundleDirectory);
-    
-    zipClose(zipFile, NULL);
+    catch (...)
+    {
+        zipClose(zipFile, NULL);
+        throw;
+    }
     
     return ipaPath.string();
 }
