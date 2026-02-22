@@ -21,7 +21,21 @@
 #include <iostream>
 #include <fstream>
 #include <sstream>
+#include <thread>
+#include <chrono>
+#include <iomanip>
+#include <cstdlib>
+#include <cstring>
 #include <condition_variable>
+#include <mutex>
+#ifndef _WIN32
+#include <unistd.h>
+#include <sys/wait.h>
+#include <spawn.h>
+#include <fcntl.h>
+#include <errno.h>
+#endif
+#include <cctype>
 
 #include "Archiver.hpp"
 #include "ServerError.hpp"
@@ -31,6 +45,7 @@
 #include "ConnectionError.hpp"
 
 #include <WinSock2.h>
+#include <usbmuxd.h>
 
 #define DEVICE_LISTENING_SOCKET 28151
 
@@ -70,6 +85,670 @@ std::string replace_all(
 	}
 	result.append(str, from, string::npos);
 	return result;
+}
+
+static uint32_t EffectiveAfcWriteChunkSize()
+{
+	uint32_t write_chunk_size = 512 * 1024;
+
+	const char* chunk_env = getenv("LIBIMOBILEDEVICE_AFC_WRITE_CHUNK_SIZE");
+	if (!chunk_env || !chunk_env[0])
+	{
+		return write_chunk_size;
+	}
+
+	char* end = NULL;
+	unsigned long value = strtoul(chunk_env, &end, 10);
+	if (end && end != chunk_env)
+	{
+		if (*end == 'k' || *end == 'K')
+		{
+			value *= 1024UL;
+			end++;
+		}
+		else if (*end == 'm' || *end == 'M')
+		{
+			value *= 1024UL * 1024UL;
+			end++;
+		}
+	}
+
+	if (end && *end == '\0' && value > 0)
+	{
+		if (value < 4096UL)
+		{
+			value = 4096UL;
+		}
+		else if (value > 1024UL * 1024UL)
+		{
+			value = 1024UL * 1024UL;
+		}
+		write_chunk_size = (uint32_t)value;
+	}
+
+	return write_chunk_size;
+}
+
+static bool EnvFlagEnabled(const char* name)
+{
+	const char* value = getenv(name);
+	if (!value || !value[0])
+	{
+		return false;
+	}
+	if (strcmp(value, "0") == 0)
+	{
+		return false;
+	}
+
+	auto equalsIgnoreCase = [](const char* a, const char* b) -> bool {
+		if (!a || !b)
+		{
+			return false;
+		}
+		while (*a && *b)
+		{
+			unsigned char ca = (unsigned char)*a;
+			unsigned char cb = (unsigned char)*b;
+			if (std::tolower(ca) != std::tolower(cb))
+			{
+				return false;
+			}
+			++a;
+			++b;
+		}
+		return *a == '\0' && *b == '\0';
+	};
+
+	if (equalsIgnoreCase(value, "false"))
+	{
+		return false;
+	}
+	if (equalsIgnoreCase(value, "no"))
+	{
+		return false;
+	}
+	return true;
+}
+
+static std::recursive_mutex g_usbmuxdSocketEnvMutex;
+
+class ScopedUsbmuxdSocketAddress
+{
+public:
+	ScopedUsbmuxdSocketAddress() : _lock(g_usbmuxdSocketEnvMutex)
+	{
+		const char* addr = getenv("USBMUXD_SOCKET_ADDRESS");
+		if (addr && addr[0])
+		{
+			_hadOriginal = true;
+			_original = addr;
+		}
+	}
+
+	bool hasOriginal() const { return _hadOriginal; }
+	const std::string& original() const { return _original; }
+
+	void set(const std::string& addr)
+	{
+#ifdef _WIN32
+		_putenv_s("USBMUXD_SOCKET_ADDRESS", addr.c_str());
+#else
+		setenv("USBMUXD_SOCKET_ADDRESS", addr.c_str(), 1);
+#endif
+		_touched = true;
+	}
+
+	void unset()
+	{
+#ifdef _WIN32
+		_putenv_s("USBMUXD_SOCKET_ADDRESS", "");
+#else
+		unsetenv("USBMUXD_SOCKET_ADDRESS");
+#endif
+		_touched = true;
+	}
+
+	~ScopedUsbmuxdSocketAddress()
+	{
+		if (!_touched)
+		{
+			return;
+		}
+
+#ifdef _WIN32
+		if (_hadOriginal)
+		{
+			_putenv_s("USBMUXD_SOCKET_ADDRESS", _original.c_str());
+		}
+		else
+		{
+			_putenv_s("USBMUXD_SOCKET_ADDRESS", "");
+		}
+#else
+		if (_hadOriginal)
+		{
+			setenv("USBMUXD_SOCKET_ADDRESS", _original.c_str(), 1);
+		}
+		else
+		{
+			unsetenv("USBMUXD_SOCKET_ADDRESS");
+		}
+#endif
+	}
+
+private:
+	std::unique_lock<std::recursive_mutex> _lock;
+	bool _hadOriginal{ false };
+	std::string _original;
+	bool _touched{ false };
+};
+
+static std::string AutoNetmuxdSocketAddress()
+{
+	const char* value = getenv("ALTSERVER_NETMUXD_SOCKET_ADDRESS");
+	if (value && value[0])
+	{
+		return value;
+	}
+
+	return "127.0.0.1:27015";
+}
+
+static bool IsDeviceVisibleOnCurrentMux(const std::string& udid, std::string* connType)
+{
+	if (udid.empty())
+	{
+		return false;
+	}
+
+	usbmuxd_device_info_t muxdev = {};
+	auto lookupOptions = (enum usbmux_lookup_options)((int)DEVICE_LOOKUP_USBMUX | (int)DEVICE_LOOKUP_NETWORK);
+	int res = usbmuxd_get_device(udid.c_str(), &muxdev, lookupOptions);
+	if (res > 0)
+	{
+		if (connType)
+		{
+			if (muxdev.conn_type == CONNECTION_TYPE_USB)
+			{
+				*connType = "USB";
+			}
+			else if (muxdev.conn_type == CONNECTION_TYPE_NETWORK)
+			{
+				*connType = "NETWORK";
+			}
+			else
+			{
+				*connType = "unknown";
+			}
+		}
+		return true;
+	}
+
+	return false;
+}
+
+static bool IsExecutableOnPath(const char* exe)
+{
+	if (!exe || !exe[0])
+	{
+		return false;
+	}
+
+	const char* path = getenv("PATH");
+	if (!path || !path[0])
+	{
+		return false;
+	}
+
+	std::string paths(path);
+	size_t start = 0;
+	while (start <= paths.size())
+	{
+		size_t end = paths.find(':', start);
+		if (end == std::string::npos)
+		{
+			end = paths.size();
+		}
+
+		std::string dir = paths.substr(start, end - start);
+		if (!dir.empty())
+		{
+			std::string candidate = dir;
+			if (candidate.back() != '/')
+			{
+				candidate.push_back('/');
+			}
+			candidate += exe;
+
+			if (access(candidate.c_str(), X_OK) == 0)
+			{
+				return true;
+			}
+		}
+
+		start = end + 1;
+	}
+
+	return false;
+}
+
+static int RunProcessWithStdin(const std::vector<std::string>& argv, const std::string& stdinPayload)
+{
+#ifdef _WIN32
+	(void)argv;
+	(void)stdinPayload;
+	return -1;
+#else
+	extern char** environ;
+
+	if (argv.empty())
+	{
+		return -1;
+	}
+
+	int pipefd[2] = {-1, -1};
+	if (pipe(pipefd) != 0)
+	{
+		return -1;
+	}
+
+	posix_spawn_file_actions_t actions;
+	if (posix_spawn_file_actions_init(&actions) != 0)
+	{
+		close(pipefd[0]);
+		close(pipefd[1]);
+		return -1;
+	}
+
+	// Child stdin from pipe.
+	posix_spawn_file_actions_adddup2(&actions, pipefd[0], STDIN_FILENO);
+	posix_spawn_file_actions_addclose(&actions, pipefd[0]);
+	posix_spawn_file_actions_addclose(&actions, pipefd[1]);
+
+	// Keep logs clean unless explicitly requested.
+	if (!EnvFlagEnabled("ALTSERVER_AFCCLIENT_VERBOSE"))
+	{
+		posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0);
+		posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+	}
+
+	std::vector<char*> args;
+	args.reserve(argv.size() + 1);
+	for (const auto& s : argv)
+	{
+		args.push_back(const_cast<char*>(s.c_str()));
+	}
+	args.push_back(nullptr);
+
+	pid_t pid = 0;
+	int spawnErr = posix_spawnp(&pid, args[0], &actions, NULL, args.data(), environ);
+	posix_spawn_file_actions_destroy(&actions);
+
+	// Parent
+	close(pipefd[0]);
+
+	if (spawnErr != 0)
+	{
+		close(pipefd[1]);
+		return 127;
+	}
+
+	const char* data = stdinPayload.data();
+	size_t remaining = stdinPayload.size();
+	while (remaining > 0)
+	{
+		ssize_t w = write(pipefd[1], data, remaining);
+		if (w < 0)
+		{
+			if (errno == EINTR)
+			{
+				continue;
+			}
+			break;
+		}
+		data += (size_t)w;
+		remaining -= (size_t)w;
+	}
+
+	close(pipefd[1]);
+
+	int status = 0;
+	if (waitpid(pid, &status, 0) < 0)
+	{
+		return -1;
+	}
+
+	if (WIFEXITED(status))
+	{
+		return WEXITSTATUS(status);
+	}
+
+	if (WIFSIGNALED(status))
+	{
+		return 128 + WTERMSIG(status);
+	}
+
+	return -1;
+#endif
+}
+
+static void WriteFileWithAfcclient(const std::string& deviceUDID, const std::string& localFilepath, const std::string& destinationPath)
+{
+#ifdef _WIN32
+	(void)deviceUDID;
+	(void)localFilepath;
+	(void)destinationPath;
+	throw ServerError(ServerErrorCode::DeviceWriteFailed);
+#else
+	// Opt-in only. This is primarily a performance workaround for very slow USB AFC writes
+	// in the bundled static stack on newer iOS versions.
+	if (!EnvFlagEnabled("ALTSERVER_USE_SYSTEM_AFCCLIENT"))
+	{
+		throw ServerError(ServerErrorCode::DeviceWriteFailed);
+	}
+
+	// Require afcclient in PATH.
+	if (!IsExecutableOnPath("afcclient"))
+	{
+		throw ServerError(ServerErrorCode::DeviceWriteFailed);
+	}
+
+	// NOTE: We deliberately avoid spaces in our temp paths, so the simple tokenization in
+	// afcclient commands remains safe.
+	std::ostringstream script;
+	script << "mkdir PublicStaging\n";
+	script << "put " << localFilepath << " " << destinationPath << "\n";
+	script << "quit\n";
+
+	std::vector<std::string> argv = { "afcclient", "-u", deviceUDID };
+
+	std::error_code ec;
+	uint64_t totalBytes = (uint64_t)fs::file_size(localFilepath, ec);
+	if (ec)
+	{
+		totalBytes = 0;
+	}
+
+	auto start = std::chrono::steady_clock::now();
+	int rc = RunProcessWithStdin(argv, script.str());
+	auto end = std::chrono::steady_clock::now();
+	double elapsed = std::chrono::duration<double>(end - start).count();
+	double avgMiBps = (elapsed > 0.0) ? ((double)totalBytes / (1024.0 * 1024.0)) / elapsed : 0.0;
+
+	{
+		std::ostringstream oss;
+		oss << std::fixed << std::setprecision(2);
+		oss << "[WRITE] afcclient rc=" << rc
+			<< " elapsed=" << elapsed << "s"
+			<< " avg=" << avgMiBps << "MiB/s"
+			<< " bytes=" << totalBytes;
+		std::cout << oss.str() << std::endl;
+	}
+
+	if (rc != 0)
+	{
+		throw ServerError(ServerErrorCode::DeviceWriteFailed);
+	}
+#endif
+}
+
+struct WriteMuxInfo
+{
+	std::string muxProvider;   // "usbmuxd" or "netmuxd" (best-effort hint)
+	std::string muxSocket;     // USBMUXD_SOCKET_ADDRESS value, or "default"
+	std::string connType;      // "USB", "NETWORK", or "unknown"
+	uint32_t afcChunkBytes{ 0 };
+};
+
+static WriteMuxInfo GetWriteMuxInfo(const std::string& udid)
+{
+	WriteMuxInfo info;
+
+	const char* muxAddr = getenv("USBMUXD_SOCKET_ADDRESS");
+	info.muxSocket = (muxAddr && muxAddr[0]) ? muxAddr : "default";
+	info.afcChunkBytes = EffectiveAfcWriteChunkSize();
+
+	// Best-effort: netmuxd usage is typically indicated by a TCP socket address.
+	if (muxAddr && muxAddr[0] && strchr(muxAddr, ':') != NULL)
+	{
+		info.muxProvider = "netmuxd";
+	}
+	else
+	{
+		info.muxProvider = "usbmuxd";
+	}
+
+	info.connType = "unknown";
+	usbmuxd_device_info_t muxdev = {};
+	auto lookupOptions = (enum usbmux_lookup_options)((int)DEVICE_LOOKUP_USBMUX | (int)DEVICE_LOOKUP_NETWORK);
+	int res = usbmuxd_get_device(udid.c_str(), &muxdev, lookupOptions);
+	if (res > 0)
+	{
+		if (muxdev.conn_type == CONNECTION_TYPE_USB)
+		{
+			info.connType = "USB";
+		}
+		else if (muxdev.conn_type == CONNECTION_TYPE_NETWORK)
+		{
+			info.connType = "NETWORK";
+		}
+	}
+
+	return info;
+}
+
+static void LogWritingToDeviceHeader(const std::string& udid, uint64_t totalBytes, int totalFiles, const WriteMuxInfo& muxInfo)
+{
+	std::cout
+		<< "[WRITE] begin udid=" << udid
+		<< " mux=" << muxInfo.muxProvider
+		<< " socket=" << muxInfo.muxSocket
+		<< " conn=" << muxInfo.connType
+		<< " afc_chunk=" << muxInfo.afcChunkBytes << "B"
+		<< " total_files=" << totalFiles
+		<< " total_bytes=" << totalBytes
+		<< std::endl;
+}
+
+static idevice_t FindDeviceWithRetry(const std::string& udid, enum idevice_options options, int maxAttempts, int retryDelayMs, bool printRecoveryLog)
+{
+	idevice_t device = NULL;
+
+	for (int attempt = 1; attempt <= maxAttempts; attempt++)
+	{
+		auto result = idevice_new_with_options(&device, udid.c_str(), options);
+		if (result == IDEVICE_E_SUCCESS && device != NULL)
+		{
+			if (printRecoveryLog && attempt > 1)
+			{
+				std::cout << "Recovered device lookup on attempt " << attempt << "." << std::endl;
+			}
+			return device;
+		}
+
+		if (device)
+		{
+			idevice_free(device);
+			device = NULL;
+		}
+
+		if (attempt < maxAttempts)
+		{
+			std::this_thread::sleep_for(std::chrono::milliseconds(retryDelayMs));
+		}
+	}
+
+	return NULL;
+}
+
+static void LogAvailableDeviceList()
+{
+	int count = 0;
+	idevice_info_t* devices = NULL;
+	auto result = idevice_get_device_list_extended(&devices, &count);
+	if (result < 0 || devices == NULL)
+	{
+		std::cout << "Device list dump failed (idevice_get_device_list_extended=" << result << ")." << std::endl;
+		return;
+	}
+
+	std::cout << "Device list dump (" << count << "):" << std::endl;
+	for (int i = 0; i < count; i++)
+	{
+		auto deviceInfo = devices[i];
+		std::cout << "  - udid=" << (deviceInfo->udid ? deviceInfo->udid : "<null>")
+			<< " conn_type=" << deviceInfo->conn_type << std::endl;
+	}
+
+	idevice_device_list_extended_free(devices);
+}
+
+static idevice_t FindPreferredDeviceOnCurrentMuxWithRetry(const std::string& udid, bool printFailureLogs)
+{
+	constexpr int kRetryDelayMs = 200;
+	constexpr int kBalancedLookupAttempts = 20;   // ~4s
+	constexpr int kNetmuxdLookupAttempts = 40; // ~8s (netmuxd startup / mDNS discovery can be slow)
+	constexpr int kUsbOnlyAttempts = 10;       // ~2s fallback
+
+	auto balancedFlags = (enum idevice_options)((int)IDEVICE_LOOKUP_NETWORK | (int)IDEVICE_LOOKUP_USBMUX);
+
+	// Best-effort hint: a TCP mux backend is typically netmuxd extension mode.
+	const char* muxAddr = getenv("USBMUXD_SOCKET_ADDRESS");
+	bool isTcpMux = (muxAddr && muxAddr[0] && strchr(muxAddr, ':') != NULL && strncmp(muxAddr, "UNIX:", 5) != 0);
+
+	int balancedAttempts = isTcpMux ? kNetmuxdLookupAttempts : kBalancedLookupAttempts;
+	auto device = FindDeviceWithRetry(udid, balancedFlags, balancedAttempts, kRetryDelayMs, true);
+	if (device)
+	{
+		return device;
+	}
+
+	// netmuxd extension mode doesn't expose USB devices, so a USB-only fallback is wasted time.
+	if (isTcpMux)
+	{
+		if (!device && printFailureLogs)
+		{
+			std::cout << "Device lookup failed for udid=" << udid << std::endl;
+			LogAvailableDeviceList();
+		}
+		return NULL;
+	}
+
+	if (printFailureLogs)
+	{
+		std::cout << "Device lookup fallback: trying USB-only lookup..." << std::endl;
+	}
+	device = FindDeviceWithRetry(udid, IDEVICE_LOOKUP_USBMUX, kUsbOnlyAttempts, kRetryDelayMs, true);
+	if (!device && printFailureLogs)
+	{
+		std::cout << "Device lookup failed for udid=" << udid << std::endl;
+		LogAvailableDeviceList();
+	}
+	return device;
+}
+
+static idevice_t FindPreferredDeviceWithRetry(const std::string& udid, ScopedUsbmuxdSocketAddress& muxEnv)
+{
+	// Select mux backend per operation:
+	// - Prefer default USB mux (usbmuxd / unix socket).
+	// - If not found, fall back to:
+	//   - the originally configured USBMUXD_SOCKET_ADDRESS (if any), else
+	//   - a default netmuxd TCP socket (127.0.0.1:27015) or ALTSERVER_NETMUXD_SOCKET_ADDRESS.
+	//
+	// This makes daemon installs work with "USB first, Wi‑Fi otherwise" without requiring
+	// starting the whole daemon with --prefer-netmuxd.
+
+	bool allowAutoNetmuxd = !EnvFlagEnabled("ALTSERVER_DISABLE_AUTO_NETMUXD");
+
+	// 1) Prefer USB/default backend.
+	muxEnv.unset();
+	std::string usbConnType;
+	if (IsDeviceVisibleOnCurrentMux(udid, &usbConnType) && muxEnv.hasOriginal())
+	{
+		std::cout << "Device visible on USB (" << usbConnType << "); prioritizing usbmuxd over USBMUXD_SOCKET_ADDRESS." << std::endl;
+	}
+
+	if (auto device = FindPreferredDeviceOnCurrentMuxWithRetry(udid, false))
+	{
+		return device;
+	}
+
+	// 2) Fall back to original socket (explicit) or auto netmuxd.
+	std::string fallbackSocket;
+	bool triedOriginalSocket = false;
+	bool triedNetmuxdSocket = false;
+
+	if (muxEnv.hasOriginal())
+	{
+		fallbackSocket = muxEnv.original();
+		triedOriginalSocket = true;
+		muxEnv.set(fallbackSocket);
+
+		std::string connType;
+		if (!IsDeviceVisibleOnCurrentMux(udid, &connType))
+		{
+			connType = "unknown";
+		}
+		std::cout << "Device lookup: retrying via USBMUXD_SOCKET_ADDRESS=" << fallbackSocket << " (" << connType << ")" << std::endl;
+
+		if (auto device = FindPreferredDeviceOnCurrentMuxWithRetry(udid, false))
+		{
+			return device;
+		}
+	}
+	else if (allowAutoNetmuxd)
+	{
+		fallbackSocket = AutoNetmuxdSocketAddress();
+		triedNetmuxdSocket = true;
+		muxEnv.set(fallbackSocket);
+
+		std::string connType;
+		if (!IsDeviceVisibleOnCurrentMux(udid, &connType))
+		{
+			connType = "unknown";
+		}
+		std::cout << "Device lookup: retrying via netmuxd USBMUXD_SOCKET_ADDRESS=" << fallbackSocket << " (" << connType << ")" << std::endl;
+
+		if (auto device = FindPreferredDeviceOnCurrentMuxWithRetry(udid, false))
+		{
+			return device;
+		}
+	}
+
+	// Nothing found on any mux backend.
+	std::cout << "Device lookup failed for udid=" << udid;
+	if (triedOriginalSocket)
+	{
+		std::cout << " (not visible on usbmuxd or USBMUXD_SOCKET_ADDRESS)." << std::endl;
+	}
+	else if (triedNetmuxdSocket)
+	{
+		std::cout << " (not visible on usbmuxd or netmuxd)." << std::endl;
+	}
+	else
+	{
+		std::cout << " (not visible on usbmuxd)." << std::endl;
+	}
+
+	std::cout << "Device list on usbmuxd (default):" << std::endl;
+	muxEnv.unset();
+	LogAvailableDeviceList();
+
+	if (muxEnv.hasOriginal())
+	{
+		std::cout << "Device list on USBMUXD_SOCKET_ADDRESS=" << muxEnv.original() << ":" << std::endl;
+		muxEnv.set(muxEnv.original());
+		LogAvailableDeviceList();
+	}
+	else if (allowAutoNetmuxd)
+	{
+		std::cout << "Device list on netmuxd USBMUXD_SOCKET_ADDRESS=" << fallbackSocket << ":" << std::endl;
+		muxEnv.set(fallbackSocket);
+		LogAvailableDeviceList();
+	}
+
+	return NULL;
 }
 
 DeviceManager* DeviceManager::_instance = nullptr;
@@ -186,23 +865,25 @@ pplx::task<void> DeviceManager::InstallApp(std::string appFilepath, std::string 
 		{
 			fs::path filepath(appFilepath);
 
-			auto extension = filepath.extension().string();
-			std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char c) {
-				return std::tolower(c);
-				});
+				auto extension = filepath.extension().string();
+				std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char c) {
+					return std::tolower(c);
+					});
 
-			fs::path appBundlePath;
+				std::optional<fs::path> inputIpaPath = std::nullopt;
+				fs::path appBundlePath;
 
-			if (extension == ".app")
-			{
-				appBundlePath = filepath;
-			}
-			else if (extension == ".ipa")
-			{
-				std::cout << "Unzipping .ipa..." << std::endl;
-				appBundlePath = UnzipAppBundle(filepath.string(), temporaryDirectory.string());
-			}
-			else
+				if (extension == ".app")
+				{
+					appBundlePath = filepath;
+				}
+				else if (extension == ".ipa")
+				{
+					inputIpaPath = filepath;
+					std::cout << "Unzipping .ipa..." << std::endl;
+					appBundlePath = UnzipAppBundle(filepath.string(), temporaryDirectory.string());
+				}
+				else
 			{
 				throw SignError(SignErrorCode::InvalidApp);
 			}
@@ -228,7 +909,8 @@ pplx::task<void> DeviceManager::InstallApp(std::string appFilepath, std::string 
 
 			/* Find Device */
 
-			if (idevice_new_with_options(&device, deviceUDID.c_str(), (enum idevice_options)((int)IDEVICE_LOOKUP_NETWORK | (int)IDEVICE_LOOKUP_USBMUX)) != IDEVICE_E_SUCCESS)
+			ScopedUsbmuxdSocketAddress muxEnv;
+			if (!(device = FindPreferredDeviceWithRetry(deviceUDID, muxEnv)))
 			{
 				throw ServerError(ServerErrorCode::DeviceNotFound);
 			}
@@ -304,41 +986,167 @@ pplx::task<void> DeviceManager::InstallApp(std::string appFilepath, std::string 
 				}
 
 				free(files);
-			}
+				}
 
-			std::cout << "Writing to device..." << std::endl;
+						fs::path packagedIpaPath;
+						bool didPackageIpa = false;
+						if (inputIpaPath.has_value())
+						{
+							packagedIpaPath = *inputIpaPath;
+						}
+						else
+						{
+							didPackageIpa = true;
+							std::cout << "Packaging .app into .ipa..." << std::endl;
+							packagedIpaPath = ZipAppBundle(appBundlePath.string());
+						}
 
-			plist_t options = instproxy_client_options_new();
-			instproxy_client_options_add(options, "PackageType", "Developer", NULL);
+						// Avoid leaving large packaged IPAs next to the original .app. Move into our temp dir so
+						// it is cleaned up by the existing finish() handler.
+						if (didPackageIpa)
+						{
+							std::error_code moveError;
+							fs::path movedPath = fs::path(temporaryDirectory).append(packagedIpaPath.filename().string());
+							fs::rename(packagedIpaPath, movedPath, moveError);
+							if (moveError)
+							{
+								std::error_code copyError;
+								fs::copy_file(packagedIpaPath, movedPath, fs::copy_options::overwrite_existing, copyError);
+								if (!copyError)
+								{
+									std::error_code removeError;
+									fs::remove(packagedIpaPath, removeError);
+									packagedIpaPath = movedPath;
+								}
+							}
+							else
+							{
+								packagedIpaPath = movedPath;
+							}
+						}
 
-			fs::path destinationPath = stagingPath.append(appBundlePath.filename().string());
+						std::error_code packageSizeError;
+						uint64_t totalBytes = (uint64_t)fs::file_size(packagedIpaPath, packageSizeError);
+						if (packageSizeError)
+						{
+						totalBytes = 0;
+					}
 
-			int numberOfFiles = 0;
-			for (auto& item : fs::recursive_directory_iterator(appBundlePath))
-			{
-				if (item.is_regular_file())
-				{
-					numberOfFiles++;
-				}				
-			}
+					std::cout << "Writing to device..." << std::endl;
 
-			int writtenFiles = 0;
+					plist_t options = instproxy_client_options_new();
+					instproxy_client_options_add(options, "PackageType", "Developer", NULL);
 
-			try
-			{
-				this->WriteDirectory(afc, appBundlePath.string(), destinationPath.string(), [numberOfFiles, &writtenFiles, &progressCompletionHandler](std::string filepath) {
-					writtenFiles++;
+					fs::path destinationPath = fs::path(stagingPath).append(UUID + ".ipa");
 
-					double progress = (double)writtenFiles / (double)numberOfFiles;
-					double weightedProgress = progress * 0.75;
-					progressCompletionHandler(weightedProgress);
-				});
-			}
-			catch (ServerError& e)
-			{
-				if (application->bundleIdentifier().find("science.xnu.undecimus") != std::string::npos)
-				{
-					auto userInfo = e.userInfo();
+					int numberOfFiles = 1;
+					uint64_t writtenBytes = 0;
+
+					const WriteMuxInfo muxInfo = GetWriteMuxInfo(deviceUDID);
+					LogWritingToDeviceHeader(deviceUDID, totalBytes, numberOfFiles, muxInfo);
+
+					auto writingStart = std::chrono::steady_clock::now();
+					auto lastLogTime = writingStart;
+					uint64_t lastLogBytes = 0;
+					int lastLogBucket = -5;
+					const auto kWriteLogInterval = std::chrono::seconds(15);
+
+					auto writeProgress = [totalBytes, &writtenBytes, writingStart, &lastLogTime, &lastLogBytes, &lastLogBucket, muxInfo, packagedIpaPath, kWriteLogInterval, &progressCompletionHandler]
+					(std::string filepath, uint64_t fileBytesWritten, uint64_t fileTotalBytes, uint32_t chunkBytes) {
+						if (chunkBytes > 0)
+						{
+							writtenBytes += (uint64_t)chunkBytes;
+						}
+
+						if (totalBytes == 0)
+						{
+							return;
+						}
+
+						auto now = std::chrono::steady_clock::now();
+						double percent = (double)writtenBytes * 100.0 / (double)totalBytes;
+						if (percent > 100.0)
+						{
+							percent = 100.0;
+						}
+
+						int bucket = (int)(percent / 5.0) * 5;
+						bool bucketDue = (bucket > lastLogBucket);
+						bool timeDue = ((now - lastLogTime) >= kWriteLogInterval);
+						if (!bucketDue && !timeDue)
+						{
+							return;
+						}
+
+						double totalSeconds = std::chrono::duration<double>(now - writingStart).count();
+						double instSeconds = std::chrono::duration<double>(now - lastLogTime).count();
+
+						uint64_t instBytes = writtenBytes - lastLogBytes;
+						double avgMiBps = (totalSeconds > 0.0) ? ((double)writtenBytes / (1024.0 * 1024.0)) / totalSeconds : 0.0;
+						double instMiBps = (instSeconds > 0.0) ? ((double)instBytes / (1024.0 * 1024.0)) / instSeconds : 0.0;
+
+						std::error_code ec;
+						std::string relPath = fs::path(filepath).filename().string();
+						fs::path rel = fs::relative(filepath, packagedIpaPath.parent_path(), ec);
+						if (!ec && !rel.empty())
+						{
+							relPath = rel.string();
+						}
+
+						std::ostringstream oss;
+						oss << std::fixed << std::setprecision(1);
+						oss
+							<< "[WRITE] " << std::setw(5) << percent << "% "
+							<< "inst=" << instMiBps << "MiB/s "
+							<< "avg=" << avgMiBps << "MiB/s "
+							<< "bytes=" << writtenBytes << "/" << totalBytes << " "
+							<< "chunk=" << chunkBytes << "B "
+							<< "file=" << relPath << " " << fileBytesWritten << "/" << fileTotalBytes << " "
+							<< "mux=" << muxInfo.muxProvider << " "
+							<< "conn=" << muxInfo.connType << " "
+							<< "afc_chunk=" << muxInfo.afcChunkBytes << "B";
+						std::cout << oss.str() << std::endl;
+
+						progressCompletionHandler((double)bucket / 100.0 * 0.75);
+
+						lastLogTime = now;
+						lastLogBytes = writtenBytes;
+						if (bucket > lastLogBucket)
+						{
+							lastLogBucket = bucket;
+						}
+						};
+
+						try
+						{
+							const bool useSystemAfcclient =
+								(muxInfo.muxProvider == "usbmuxd") &&
+								(muxInfo.connType == "USB") &&
+								(totalBytes >= 8ULL * 1024ULL * 1024ULL) &&
+								EnvFlagEnabled("ALTSERVER_USE_SYSTEM_AFCCLIENT") &&
+								IsExecutableOnPath("afcclient");
+
+							if (useSystemAfcclient)
+							{
+								std::cout << "[WRITE] using system afcclient for USB upload" << std::endl;
+								WriteFileWithAfcclient(deviceUDID, packagedIpaPath.string(), destinationPath.string());
+								writtenBytes = totalBytes;
+								progressCompletionHandler(0.75);
+							}
+							else
+							{
+								this->WriteFile(afc, packagedIpaPath.string(), destinationPath.string(),
+									[&progressCompletionHandler](std::string filepath) {
+										progressCompletionHandler(0.75);
+									},
+									writeProgress);
+							}
+						}
+						catch (ServerError& e)
+						{
+						if (application->bundleIdentifier().find("science.xnu.undecimus") != std::string::npos)
+						{
+						auto userInfo = e.userInfo();
 					userInfo["NSLocalizedRecoverySuggestion"] = "Make sure Windows real-time protection is disabled on your computer then try again.";
 
 					throw ServerError((ServerErrorCode)e.code(), userInfo);
@@ -371,15 +1179,30 @@ pplx::task<void> DeviceManager::InstallApp(std::string appFilepath, std::string 
 				else
 				{
 					throw;
+					}
 				}
-			}
 
-			std::cout << "Finished writing to device." << std::endl;
+				{
+					auto writingEnd = std::chrono::steady_clock::now();
+					double totalSeconds = std::chrono::duration<double>(writingEnd - writingStart).count();
+					double avgMiBps = (totalSeconds > 0.0) ? ((double)writtenBytes / (1024.0 * 1024.0)) / totalSeconds : 0.0;
+					std::ostringstream oss;
+					oss << std::fixed << std::setprecision(2);
+					oss << "[WRITE] done bytes=" << writtenBytes << "/" << totalBytes << " "
+						<< "elapsed=" << totalSeconds << "s "
+						<< "avg=" << avgMiBps << "MiB/s "
+						<< "mux=" << muxInfo.muxProvider << " "
+						<< "conn=" << muxInfo.connType << " "
+						<< "afc_chunk=" << muxInfo.afcChunkBytes << "B";
+					std::cout << oss.str() << std::endl;
+				}
+
+				std::cout << "Finished writing to device." << std::endl;
 
 
-			if (service)
-			{
-				lockdownd_service_descriptor_free(service);
+				if (service)
+				{
+					lockdownd_service_descriptor_free(service);
 				service = NULL;
 			}
 
@@ -471,16 +1294,23 @@ pplx::task<void> DeviceManager::InstallApp(std::string appFilepath, std::string 
 			instproxy_install(ipc, narrowDestinationPath.c_str(), options, DeviceManagerUpdateStatus, uuidString);
 			instproxy_client_options_free(options);
 
-			// Wait until we're finished installing;
-			std::unique_lock<std::mutex> lock(waitingMutex);
-			cv.wait(lock, [&didFinishInstalling] { return didFinishInstalling; });
+				// Wait until we're finished installing;
+				std::unique_lock<std::mutex> lock(waitingMutex);
+				cv.wait(lock, [&didFinishInstalling] { return didFinishInstalling; });
 
-			lock.unlock();
+				lock.unlock();
 
-			if (serverError.has_value())
-			{
-				throw serverError.value();
-			}
+				// Best-effort cleanup of staging file to avoid filling device storage.
+				// (If installd is still using the payload, it will fail and be ignored.)
+				if (afc != NULL)
+				{
+					afc_remove_path(afc, narrowDestinationPath.c_str());
+				}
+
+				if (serverError.has_value())
+				{
+					throw serverError.value();
+				}
 
 			if (localizedError.has_value())
 			{
@@ -508,7 +1338,7 @@ pplx::task<void> DeviceManager::InstallApp(std::string appFilepath, std::string 
 	});
 }
 
-void DeviceManager::WriteDirectory(afc_client_t client, std::string directoryPath, std::string destinationPath, std::function<void(std::string)> wroteFileCallback)
+void DeviceManager::WriteDirectory(afc_client_t client, std::string directoryPath, std::string destinationPath, std::function<void(std::string)> wroteFileCallback, WriteProgressCallback progressCallback)
 {
 	std::replace(destinationPath.begin(), destinationPath.end(), '\\', '/');
 
@@ -521,53 +1351,88 @@ void DeviceManager::WriteDirectory(afc_client_t client, std::string directoryPat
         if (fs::is_directory(filepath))
         {
             auto destinationDirectoryPath = fs::path(destinationPath).append(filepath.filename().string());
-            this->WriteDirectory(client, filepath.string(), destinationDirectoryPath.string(), wroteFileCallback);
+            this->WriteDirectory(client, filepath.string(), destinationDirectoryPath.string(), wroteFileCallback, progressCallback);
         }
         else
         {
             auto destinationFilepath = fs::path(destinationPath).append(filepath.filename().string());
-            this->WriteFile(client, filepath.string(), destinationFilepath.string(), wroteFileCallback);
+            this->WriteFile(client, filepath.string(), destinationFilepath.string(), wroteFileCallback, progressCallback);
         }
     }
 }
 
-void DeviceManager::WriteFile(afc_client_t client, std::string filepath, std::string destinationPath, std::function<void(std::string)> wroteFileCallback)
+void DeviceManager::WriteFile(afc_client_t client, std::string filepath, std::string destinationPath, std::function<void(std::string)> wroteFileCallback, WriteProgressCallback progressCallback)
 {
 	std::replace(destinationPath.begin(), destinationPath.end(), '\\', '/');
 	destinationPath = replace_all(destinationPath, "__colon__", ":");
 
-	odslog("Writing File: " << filepath.c_str() << " to: " << destinationPath.c_str());
-    
-    auto data = readFile(filepath.c_str());
-    
-    uint64_t af = 0;
-    if ((afc_file_open(client, destinationPath.c_str(), AFC_FOPEN_WRONLY, &af) != AFC_E_SUCCESS) || af == 0)
-    {
-        throw ServerError(ServerErrorCode::DeviceWriteFailed);
-    }
-    
-    uint32_t bytesWritten = 0;
-    
-    while (bytesWritten < data.size())
-    {
-        uint32_t count = 0;
-        
-        if (afc_file_write(client, af, (const char *)data.data() + bytesWritten, (uint32_t)data.size() - bytesWritten, &count) != AFC_E_SUCCESS)
-        {
-            throw ServerError(ServerErrorCode::DeviceWriteFailed);
-        }
-        
-        bytesWritten += count;
-    }
-    
-    if (bytesWritten != data.size())
-    {
-        throw ServerError(ServerErrorCode::DeviceWriteFailed);
-    }
-    
-    afc_file_close(client, af);
+	std::error_code ec;
+	uint64_t fileTotalBytes = (uint64_t)fs::file_size(filepath, ec);
+	if (ec)
+	{
+		fileTotalBytes = 0;
+	}
 
-	wroteFileCallback(filepath);
+	std::ifstream ifs(filepath, std::ios::binary);
+	if (!ifs)
+	{
+		throw ServerError(ServerErrorCode::DeviceWriteFailed);
+	}
+
+	uint64_t af = 0;
+	if ((afc_file_open(client, destinationPath.c_str(), AFC_FOPEN_WRONLY, &af) != AFC_E_SUCCESS) || af == 0)
+	{
+		throw ServerError(ServerErrorCode::DeviceWriteFailed);
+	}
+
+	constexpr size_t kReadBufferSize = 1024 * 1024; // 1 MiB
+	std::vector<char> buffer(kReadBufferSize);
+
+	uint64_t totalWritten = 0;
+
+	while (ifs)
+	{
+		ifs.read(buffer.data(), buffer.size());
+		std::streamsize got = ifs.gcount();
+		if (got <= 0)
+		{
+			break;
+		}
+
+		uint32_t offset = 0;
+		uint32_t chunkLen = (uint32_t)got;
+
+		while (offset < chunkLen)
+		{
+			uint32_t count = 0;
+			uint32_t toWrite = chunkLen - offset;
+
+			if (afc_file_write(client, af, buffer.data() + offset, toWrite, &count) != AFC_E_SUCCESS || count == 0)
+			{
+				throw ServerError(ServerErrorCode::DeviceWriteFailed);
+			}
+
+			offset += count;
+			totalWritten += (uint64_t)count;
+
+			if (progressCallback)
+			{
+				progressCallback(filepath, totalWritten, fileTotalBytes, count);
+			}
+		}
+	}
+
+	if (fileTotalBytes > 0 && totalWritten != fileTotalBytes)
+	{
+		throw ServerError(ServerErrorCode::DeviceWriteFailed);
+	}
+
+	afc_file_close(client, af);
+
+	if (wroteFileCallback)
+	{
+		wroteFileCallback(filepath);
+	}
 }
 
 pplx::task<void> DeviceManager::RemoveApp(std::string bundleIdentifier, std::string deviceUDID)
@@ -599,7 +1464,8 @@ pplx::task<void> DeviceManager::RemoveApp(std::string bundleIdentifier, std::str
 		try 
 		{
 			/* Find Device */
-			if (idevice_new_with_options(&device, deviceUDID.c_str(), (enum idevice_options)((int)IDEVICE_LOOKUP_NETWORK | (int)IDEVICE_LOOKUP_USBMUX)) != IDEVICE_E_SUCCESS)
+			ScopedUsbmuxdSocketAddress muxEnv;
+			if (!(device = FindPreferredDeviceWithRetry(deviceUDID, muxEnv)))
 			{
 				throw ServerError(ServerErrorCode::DeviceNotFound);
 			}
@@ -755,7 +1621,8 @@ pplx::task<void> DeviceManager::InstallProvisioningProfiles(std::vector<std::sha
 		try
 		{
 			/* Find Device */
-			if (idevice_new_with_options(&device, deviceUDID.c_str(), (enum idevice_options)((int)IDEVICE_LOOKUP_NETWORK | (int)IDEVICE_LOOKUP_USBMUX)) != IDEVICE_E_SUCCESS)
+			ScopedUsbmuxdSocketAddress muxEnv;
+			if (!(device = FindPreferredDeviceWithRetry(deviceUDID, muxEnv)))
 			{
 				throw ServerError(ServerErrorCode::DeviceNotFound);
 			}
@@ -857,7 +1724,8 @@ pplx::task<void> DeviceManager::RemoveProvisioningProfiles(std::set<std::string>
 		try
 		{
 			/* Find Device */
-			if (idevice_new_with_options(&device, deviceUDID.c_str(), (enum idevice_options)((int)IDEVICE_LOOKUP_NETWORK | (int)IDEVICE_LOOKUP_USBMUX)) != IDEVICE_E_SUCCESS)
+			ScopedUsbmuxdSocketAddress muxEnv;
+			if (!(device = FindPreferredDeviceWithRetry(deviceUDID, muxEnv)))
 			{
 				throw ServerError(ServerErrorCode::DeviceNotFound);
 			}
@@ -1162,7 +2030,8 @@ pplx::task<bool> DeviceManager::IsDeveloperDiskImageMounted(std::shared_ptr<Devi
 		try
 		{
 			/* Find Device */
-			if (idevice_new_with_options(&device, altDevice->identifier().c_str(), (enum idevice_options)((int)IDEVICE_LOOKUP_NETWORK | (int)IDEVICE_LOOKUP_USBMUX)) != IDEVICE_E_SUCCESS)
+			ScopedUsbmuxdSocketAddress muxEnv;
+			if (!(device = FindPreferredDeviceWithRetry(altDevice->identifier(), muxEnv)))
 			{
 				throw ServerError(ServerErrorCode::DeviceNotFound);
 			}
@@ -1286,7 +2155,8 @@ pplx::task<void> DeviceManager::InstallDeveloperDiskImage(std::string diskPath, 
 		try
 		{
 			/* Find Device */
-			if (idevice_new_with_options(&device, altDevice->identifier().c_str(), (enum idevice_options)((int)IDEVICE_LOOKUP_NETWORK | (int)IDEVICE_LOOKUP_USBMUX)) != IDEVICE_E_SUCCESS)
+			ScopedUsbmuxdSocketAddress muxEnv;
+			if (!(device = FindPreferredDeviceWithRetry(altDevice->identifier(), muxEnv)))
 			{
 				throw ServerError(ServerErrorCode::DeviceNotFound);
 			}
@@ -1456,7 +2326,8 @@ pplx::task<std::vector<InstalledApp>> DeviceManager::FetchInstalledApps(std::sha
 		};
 
 		/* Find Device */
-		if (idevice_new_with_options(&device, altDevice->identifier().c_str(), (enum idevice_options)((int)IDEVICE_LOOKUP_NETWORK | (int)IDEVICE_LOOKUP_USBMUX)) != IDEVICE_E_SUCCESS)
+		ScopedUsbmuxdSocketAddress muxEnv;
+		if (!(device = FindPreferredDeviceWithRetry(altDevice->identifier(), muxEnv)))
 		{
 			throw ServerError(ServerErrorCode::DeviceNotFound);
 		}

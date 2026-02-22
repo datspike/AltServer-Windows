@@ -16,6 +16,8 @@
 #include <map>
 #include <set>
 #include <mutex>
+#include <functional>
+#include <cstdint>
 
 #include <pplx/pplxtasks.h>
 #include <libimobiledevice/afc.h>
@@ -83,9 +85,10 @@ private:
 	std::map<std::string, std::shared_ptr<Device>>& cachedDevices();
     
     std::vector<std::shared_ptr<Device>> availableDevices(bool includeNetworkDevices) const;
-    
-    void WriteDirectory(afc_client_t client, std::string directoryPath, std::string destinationPath, std::function<void(std::string)> wroteFileCallback);
-    void WriteFile(afc_client_t client, std::string filepath, std::string destinationPath, std::function<void(std::string)> wroteFileCallback);
+
+	using WriteProgressCallback = std::function<void(std::string, uint64_t, uint64_t, uint32_t)>;
+    void WriteDirectory(afc_client_t client, std::string directoryPath, std::string destinationPath, std::function<void(std::string)> wroteFileCallback, WriteProgressCallback progressCallback);
+    void WriteFile(afc_client_t client, std::string filepath, std::string destinationPath, std::function<void(std::string)> wroteFileCallback, WriteProgressCallback progressCallback);
 
 	void InstallProvisioningProfile(std::shared_ptr<ProvisioningProfile> provisioningProfile, misagent_client_t mis);
 	void RemoveProvisioningProfile(std::shared_ptr<ProvisioningProfile> provisioningProfile, misagent_client_t mis);
