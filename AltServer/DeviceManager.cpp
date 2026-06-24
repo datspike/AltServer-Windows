@@ -1385,7 +1385,8 @@ void DeviceManager::WriteFile(afc_client_t client, std::string filepath, std::st
 		throw ServerError(ServerErrorCode::DeviceWriteFailed);
 	}
 
-	constexpr size_t kReadBufferSize = 1024 * 1024; // 1 MiB
+	const size_t kReadBufferSize = (size_t)EffectiveAfcWriteChunkSize();
+	constexpr int kTransientWriteRetryCount = 3;
 	std::vector<char> buffer(kReadBufferSize);
 
 	uint64_t totalWritten = 0;
@@ -1404,11 +1405,48 @@ void DeviceManager::WriteFile(afc_client_t client, std::string filepath, std::st
 
 		while (offset < chunkLen)
 		{
-			uint32_t count = 0;
 			uint32_t toWrite = chunkLen - offset;
+			uint32_t count = 0;
+			afc_error_t writeResult = AFC_E_UNKNOWN_ERROR;
+			bool wroteChunk = false;
 
-			if (afc_file_write(client, af, buffer.data() + offset, toWrite, &count) != AFC_E_SUCCESS || count == 0)
+			for (int attempt = 0; attempt < kTransientWriteRetryCount; attempt++)
 			{
+				count = 0;
+				writeResult = afc_file_write(client, af, buffer.data() + offset, toWrite, &count);
+				if (writeResult == AFC_E_SUCCESS && count > 0)
+				{
+					wroteChunk = true;
+					break;
+				}
+
+				std::cout
+					<< "[WRITE] afc_file_write failed"
+					<< " code=" << (int)writeResult
+					<< " attempt=" << (attempt + 1) << "/" << kTransientWriteRetryCount
+					<< " offset=" << (totalWritten + offset)
+					<< " to_write=" << toWrite
+					<< " wrote=" << count
+					<< std::endl;
+
+				if (count > 0)
+				{
+					break;
+				}
+
+				if (writeResult != AFC_E_MUX_ERROR &&
+					writeResult != AFC_E_NOT_ENOUGH_DATA &&
+					writeResult != AFC_E_OP_TIMEOUT)
+				{
+					break;
+				}
+
+				std::this_thread::sleep_for(std::chrono::milliseconds(250));
+			}
+
+			if (!wroteChunk)
+			{
+				afc_file_close(client, af);
 				throw ServerError(ServerErrorCode::DeviceWriteFailed);
 			}
 
